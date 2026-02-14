@@ -1,5 +1,4 @@
-# klippy/kinematics/corexzyz.py
-
+# corexzyz.py
 import math
 from . import stepper
 
@@ -7,86 +6,89 @@ class CoreXZYZKinematics:
     def __init__(self, toolhead, config):
         self.toolhead = toolhead
         
-        # printer.cfg から各ステッパーの設定を読み込む
-        # [stepper_a], [stepper_b], [stepper_c], [stepper_d] を定義することを想定
+        # 4つのステッパーレールを定義します
+        # 0, 1: XZ面を担当 (CoreXZ)
+        # 2, 3: YZ面を担当 (CoreYZ)
         self.rails = [
             stepper.PrinterRail(config.getsection('stepper_a')),
             stepper.PrinterRail(config.getsection('stepper_b')),
             stepper.PrinterRail(config.getsection('stepper_c')),
             stepper.PrinterRail(config.getsection('stepper_d')),
         ]
-        
-        # ステッパーに名前を割り当て（デバッグ用など）
-        self.rails[0].setup_pin('step_pin')
-        self.rails[1].setup_pin('step_pin')
-        self.rails[2].setup_pin('step_pin')
-        self.rails[3].setup_pin('step_pin')
+
+        # ステッパーの初期化（ピン設定など）
+        for rail in self.rails:
+            rail.setup_pin('step_pin')
+            rail.setup_pin('dir_pin')
+            rail.setup_pin('enable_pin')
 
     def get_steppers(self):
-        # ツールヘッドに「このキネマティクスはこのモーターを使うよ」と伝える
+        # ツールヘッドにこのキネマティクスが制御する全モーターを通知
         return [s.get_stepper() for s in self.rails]
 
     def calc_position(self, stepper_positions):
-        # フォワードキネマティクス: モーターの位置からヘッドの座標(XYZ)を逆算する
-        # stepper_positionsは {stepper_name: position} の辞書
+        # Forward Kinematics (モーター位置 -> XYZ座標)
         
+        # 各モーターの現在位置を取得
         pos_a = stepper_positions.get(self.rails[0].get_name(), 0.)
         pos_b = stepper_positions.get(self.rails[1].get_name(), 0.)
         pos_c = stepper_positions.get(self.rails[2].get_name(), 0.)
         pos_d = stepper_positions.get(self.rails[3].get_name(), 0.)
 
-        # 数式モデル:
-        # A = Z + X, B = Z - X  =>  2Z = A+B, 2X = A-B
-        # C = Z + Y, D = Z - Y  =>  2Z = C+D, 2Y = C-D
-        
+        # CoreXZの計算 (A = Z + X, B = Z - X と仮定)
+        # X = (A - B) / 2
+        # Z1 = (A + B) / 2
         x = 0.5 * (pos_a - pos_b)
-        y = 0.5 * (pos_c - pos_d)
-        
-        # ZはXZ面とYZ面の平均を取る（剛性が高ければ同じ値になるはず）
         z_xz = 0.5 * (pos_a + pos_b)
+
+        # CoreYZの計算 (C = Z + Y, D = Z - Y と仮定)
+        # Y = (C - D) / 2
+        # Z2 = (C + D) / 2
+        y = 0.5 * (pos_c - pos_d)
         z_yz = 0.5 * (pos_c + pos_d)
+
+        # Z軸は2つの面の平均を取る（機械的な誤差を吸収するため）
         z = 0.5 * (z_xz + z_yz)
 
         return [x, y, z]
 
-    def set_position(self, newpos, homing_axes):
-        # 位置を強制的にセットする（G92やホーミング直後など）
-        for i, rail in enumerate(self.rails):
-            rail.set_position(newpos)
-
     def check_move(self, move):
-        # インバースキネマティクス: 動きたい座標(XYZ)から各モーターのステップ位置を計算する
-        # ここが最も重要です
+        # Inverse Kinematics (XYZ移動命令 -> モーターステップ)
         
-        pos = move.axes_d
-        x = pos[0]
-        y = pos[1]
-        z = pos[2]
+        # move.axes_d は [x, y, z, e] の目標座標
+        x = move.axes_d[0]
+        y = move.axes_d[1]
+        z = move.axes_d[2]
 
-        # ステップ位置の計算
-        # X軸関連 (CoreXZ)
+        # CoreXZのロジック
+        # モーターA: Z + X
+        # モーターB: Z - X
         m_a = z + x
         m_b = z - x
-        
-        # Y軸関連 (CoreYZ)
+
+        # CoreYZのロジック
+        # モーターC: Z + Y
+        # モーターD: Z - Y
         m_c = z + y
         m_d = z - y
 
-        # Klipperのモーションキューに登録
+        # 各モーターへ移動指示
         move.move_d(self.rails[0], m_a)
         move.move_d(self.rails[1], m_b)
         move.move_d(self.rails[2], m_c)
         move.move_d(self.rails[3], m_d)
 
+    def set_position(self, newpos, homing_axes):
+        # G92などで座標が強制変更された場合、全モーターの位置を再計算してセット
+        for i, rail in enumerate(self.rails):
+            rail.set_position(newpos)
+
     def home(self, homing_state):
         # ホーミング処理
-        # 通常は homing.py のヘルパーを使いますが、Core系は軸の干渉があるため
-        # どの順番でエンドストップに当てるか定義が必要です。
-        # ここでは簡易的に全軸ホームのロジックを呼び出す形にします。
-        
-        # Klipperの標準的なホーミングルーチンへ委譲（必要に応じてカスタマイズ）
+        # CoreXZ/YZは軸が連動するため、単純なホーミングでは衝突する可能性があります。
+        # 通常は [homing_override] を printer.cfg に書いてG-codeで制御するのが安全です。
+        # ここでは最低限の軸登録のみ行います。
         return self._home_axis(homing_state)
 
-# Klipperがこのファイルを読み込んだ時にクラスをロードするためのフック
 def load_kinematics(toolhead, config):
     return CoreXZYZKinematics(toolhead, config)
